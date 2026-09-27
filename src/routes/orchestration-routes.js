@@ -4,7 +4,14 @@ import { logger } from '../logger.js'
 import { config } from '../config.js'
 
 export function registerOrchestrationRoutes(app, deps = {}) {
-  const { runHistoryStore, orchestrate: orchestrateFn, broadcast = () => {} } = deps
+  const {
+    runHistoryStore,
+    orchestrate: orchestrateFn,
+    broadcast = () => {},
+    // Optional read-only probe: (attempt) => { settled, txHash?, proof? }.
+    // See the reconcile endpoint below and docs/architecture.md (#131).
+    paymentProbe,
+  } = deps
 
   const activeExecutions = new Map() // runId -> Promise<result>
   const inFlightIdempotentRequests = new Map() // key -> Promise<{ run, fingerprint }>
@@ -101,6 +108,20 @@ export function registerOrchestrationRoutes(app, deps = {}) {
         runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
           logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
         })
+        // Payment attempts are persisted as soon as they are observed, so an
+        // attempt whose outcome is still unknown survives a crash mid-run
+        // and can be reconciled instead of being settled twice (#131).
+        if (eventWithRun.paymentAttempt) {
+          runHistoryStore
+            .recordPaymentAttempt(run.id, eventWithRun.paymentAttempt)
+            .catch((persistErr) => {
+              logger.warn('payment_attempt_persist_failed', {
+                runId: run.id,
+                attemptId: eventWithRun.paymentAttempt.id,
+                error: persistErr.message,
+              })
+            })
+        }
       }
 
       // 4. Detached background execution promise
@@ -108,6 +129,11 @@ export function registerOrchestrationRoutes(app, deps = {}) {
         try {
           const result = await orchestrateFn(task, budget, runBroadcast, {
             correlationId: req.requestId,
+            // Links every payment attempt to this run, and lets the
+            // orchestrator reconcile an unresolved outcome *before* it
+            // decides whether a fallback settlement is permitted (#131).
+            runId: run.id,
+            paymentProbe,
           })
           result.runId = run.id
           await runHistoryStore.completeRun(run.id, result)
@@ -229,6 +255,18 @@ export function registerOrchestrationRoutes(app, deps = {}) {
     }
   })
 
+  // Attempts whose outcome is unresolved (#131). Not settled charges: they
+  // may or may not have been paid, so they are reported separately from
+  // `summary` until reconciliation resolves them.
+  app.get('/api/runs/pending-payments', async (req, res, next) => {
+    try {
+      const attempts = await runHistoryStore.getPendingPayments()
+      res.json({ count: attempts.length, attempts })
+    } catch (err) {
+      next(err)
+    }
+  })
+
   app.get('/api/runs/:id', async (req, res, next) => {
     try {
       const run = await runHistoryStore.getRun(req.params.id)
@@ -239,6 +277,44 @@ export function registerOrchestrationRoutes(app, deps = {}) {
         return next(err)
       }
       res.json(run)
+    } catch (err) {
+      next(err)
+    }
+  })
+
+  // Runs one reconciliation pass over this run's pending attempts. The
+  // probe is injected because only a caller that can query the payment
+  // path can answer "did this settlement complete?" — and answering it is
+  // what authorises a fallback settlement. Without a probe configured the
+  // attempts stay visibly pending rather than being guessed at.
+  app.post('/api/runs/:id/reconcile-payments', async (req, res, next) => {
+    try {
+      if (typeof paymentProbe !== 'function') {
+        const err = new Error(
+          'No payment reconciliation probe is configured, so unresolved attempts stay pending'
+        )
+        err.status = 503
+        err.code = 'PAYMENT_PROBE_UNAVAILABLE'
+        return next(err)
+      }
+
+      const run = await runHistoryStore.getRun(req.params.id)
+      if (!run) {
+        const err = new Error(`Run '${req.params.id}' not found`)
+        err.status = 404
+        err.code = 'RUN_NOT_FOUND'
+        return next(err)
+      }
+
+      const reconciled = await runHistoryStore.reconcilePendingPayments(paymentProbe, {
+        runId: run.id,
+      })
+      const updated = await runHistoryStore.getRun(run.id)
+      res.json({
+        runId: run.id,
+        reconciledCount: reconciled.length,
+        pendingPaymentAttempts: updated?.pendingPaymentAttempts || [],
+      })
     } catch (err) {
       next(err)
     }
