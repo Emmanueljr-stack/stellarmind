@@ -228,4 +228,97 @@ await withTempFile('new-write', async (testPath) => {
   console.log('  ✓ Version: 1\n')
 })
 
+// Test 7: Completed results survive restart and remain readable by run ID
+await withTempFile('restart-output', async (testPath) => {
+  console.log('Test 7: Completed output survives restart')
+  const firstStore = new FileRunHistoryStore(testPath, 200)
+  await firstStore.init()
+
+  const created = await firstStore.createRun({ task: 'Persisted run', budget: 15, source: 'test' })
+  await firstStore.completeRun(created.id, {
+    task: 'Persisted run',
+    budget: 15,
+    plan: { steps: [{ agent: 'research-bot', input: 'Persisted run' }] },
+    results: [{ agent: 'research-bot', result: 'completed output payload' }],
+    totalSpent: 0,
+    budgetExhausted: false,
+    paymentProtocol: 'x402',
+    txCount: 0,
+    x402PaymentCount: 0,
+    xlmFallbackCount: 0,
+    unpaidCount: 0,
+    elapsed: '25ms',
+    usage: { entries: [], summary: { totalInputTokens: 0, totalOutputTokens: 0 } },
+    payments: [],
+  })
+
+  const reopened = new FileRunHistoryStore(testPath, 200)
+  await reopened.init()
+  const result = await reopened.getRun(created.id)
+
+  if (!result || result.status !== 'completed') {
+    throw new Error('Completed run should survive file restart and remain readable')
+  }
+  if (!result.outputAvailable) {
+    throw new Error('Completed output should be marked as available after restart')
+  }
+  if (!Array.isArray(result.output) || result.output.length !== 1) {
+    throw new Error('Persisted output should still include final step results after restart')
+  }
+  if (result.output[0].result !== 'completed output payload') {
+    throw new Error('Persisted result payload was not restored exactly after restart')
+  }
+  console.log('  ✓ Completed run result is recoverable after restart')
+  console.log('  ✓ Output is still marked available after reopen\n')
+})
+
+// Test 8: Legacy record without output is still readable with an availability flag
+await withTempFile('legacy-output-availability', async (testPath) => {
+  console.log('Test 8: Legacy output availability remains explicit')
+
+  const legacyData = {
+    version: 1,
+    runs: [
+      {
+        id: 'legacy_run_missing_output',
+        task: 'Legacy task',
+        budget: 7,
+        status: 'completed',
+        createdAt: '2024-01-04T00:00:00.000Z',
+        updatedAt: '2024-01-04T00:00:01.000Z',
+        completedAt: '2024-01-04T00:00:01.000Z',
+        summary: { totalSpent: 0 },
+        plan: null,
+        results: null,
+        output: undefined,
+        outputAvailable: false,
+        events: [],
+        txProofs: [],
+        usage: null,
+        error: null,
+      },
+    ],
+  }
+
+  await fs.writeFile(testPath, JSON.stringify(legacyData, null, 2), 'utf8')
+
+  const store = new FileRunHistoryStore(testPath, 200)
+  await store.init()
+
+  const run = await store.getRun('legacy_run_missing_output')
+  if (!run) {
+    throw new Error('Legacy run should still be loaded from disk')
+  }
+  if (run.outputAvailable !== false) {
+    throw new Error('Legacy runs without stored outputs should stay explicitly unavailable')
+  }
+  if (run.output !== null) {
+    throw new Error(
+      'Legacy runs should expose a null output when the persisted payload is unavailable'
+    )
+  }
+  console.log('  ✓ Legacy output availability remains explicit and non-destructive')
+  console.log('  ✓ Unavailable legacy output is surfaced as null\n')
+})
+
 console.log('All tests passed! ✓')
