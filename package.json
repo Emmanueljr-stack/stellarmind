@@ -28,7 +28,8 @@
     "test:normalization": "node tests/response-normalization.test.js",
     "test:recovery": "node tests/run-history-recovery.test.js",
     "test:demo": "node src/demo.js",
-    "prepare": "husky"
+    "prepare": "husky",
+    "test:queue": "node tests/admission-queue.test.js && node tests/admission-queue.integration.test.js"
   },
   "keywords": [
     "stellar",
