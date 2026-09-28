@@ -44,6 +44,17 @@ err = runMiddleware(validateOrchestrate, {
 })
 assertValidationError(err, 'budget', 'Invalid orchestrate request')
 
+// Unsupported fractional precision (>7 decimals for USDC)
+err = runMiddleware(validateOrchestrate, {
+  method: 'POST',
+  body: { task: 'Build a demo', budget: '0.12345678' },
+})
+assertValidationError(err, 'budget', 'Invalid orchestrate request')
+assert(
+  err.details.some((detail) => detail.code === 'UNSUPPORTED_PRECISION'),
+  'Expected UNSUPPORTED_PRECISION error code'
+)
+
 const validOrchestrate = { method: 'POST', body: { task: 'Deploy demo', budget: '0.5' } }
 err = runMiddleware(validateOrchestrate, validOrchestrate)
 assert.strictEqual(err, undefined)

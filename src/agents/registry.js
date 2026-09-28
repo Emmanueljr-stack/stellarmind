@@ -3,6 +3,7 @@
  * Each agent is a Claude-powered AI service with its own capability and pricing
  */
 import { MODEL_LABELS } from './services.js'
+import { AssetAmount, DEFAULT_ASSET } from './amount.js'
 
 export const AGENTS = [
   {
@@ -72,11 +73,18 @@ export function getAgentById(id) {
 }
 
 /**
- * Get total cost estimate for a set of agent IDs
+ * Get total cost estimate for a set of agent IDs using exact asset amounts.
+ * @param {string[]} agentIds
+ * @param {string} [asset='USDC']
+ * @returns {AssetAmount}
  */
-export function estimateCost(agentIds) {
-  return agentIds.reduce((total, id) => {
+export function estimateCost(agentIds, asset = DEFAULT_ASSET) {
+  let total = AssetAmount.zero(asset)
+  for (const id of agentIds || []) {
     const agent = getAgentById(id)
-    return total + (agent ? parseFloat(agent.price) : 0)
-  }, 0)
+    if (agent?.price) {
+      total = total.plus(AssetAmount.from(agent.price, agent.currency || asset))
+    }
+  }
+  return total
 }

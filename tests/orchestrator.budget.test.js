@@ -1,11 +1,16 @@
 /**
- * Focused unit tests for orchestrator budget guardrails.
+ * Focused unit tests for orchestrator budget guardrails & exact asset accounting.
  *
  * Covers (per acceptance criteria):
  *  - `totalSpent + cost > budget` skip behavior (incl. the strict-inequality boundary)
  *  - mixed payment outcomes and fallback modes
  *  - final summary totals and skipped-step reporting
  *  - edge cases: tiny budgets, zero budget, parse failures (NaN)
+ *  - exact asset amounts using integer base units (BigInt) with per-asset precision
+ *  - repeated small amounts without IEEE-754 drift
+ *  - exact budget equality (accepted) vs one supported unit over budget (rejected)
+ *  - unsupported fractional precision validation errors
+ *  - JSON round-trip serialization compatibility contract without network calls
  *
  * These import the SAME functions `orchestrator.js` uses, so a regression in the
  * real guardrail fails this suite. Dependency-free → deterministic and fast.
@@ -15,6 +20,7 @@
 
 import assert from 'node:assert'
 import {
+  AssetAmount,
   agentCost,
   remainingBudget,
   formatAmount,
@@ -27,6 +33,10 @@ import {
   isBudgetExhausted,
   countUsed,
   countSkipped,
+  UnsupportedPrecisionError,
+  InvalidAmountError,
+  registerAsset,
+  resetCustomAssets,
 } from '../src/agents/budget.js'
 
 // ─── Tiny test harness (collect-all, fail-fast exit) ─────────────
@@ -52,14 +62,23 @@ const code = { id: 'code-bot', name: '💻 Code Agent', price: '0.03' }
 
 // ─── agentCost / parse failures ──────────────────────────────────
 console.log('agentCost')
-test('parses a well-formed price string', () => {
-  assert.strictEqual(agentCost(analyst), 0.05)
-  assert.strictEqual(agentCost(code), 0.03)
+test('parses a well-formed price string into an exact AssetAmount', () => {
+  const analystCost = agentCost(analyst)
+  assert.ok(analystCost instanceof AssetAmount)
+  assert.strictEqual(analystCost.baseUnits, 500000n)
+  assert.strictEqual(analystCost.toNumber(), 0.05)
+  assert.strictEqual(analystCost.toExactString(), '0.05')
+
+  const codeCost = agentCost(code)
+  assert.ok(codeCost instanceof AssetAmount)
+  assert.strictEqual(codeCost.baseUnits, 300000n)
+  assert.strictEqual(codeCost.toNumber(), 0.03)
 })
 test('returns NaN for a malformed price (parse failure)', () => {
   assert.ok(Number.isNaN(agentCost({ price: 'abc' })))
   assert.ok(Number.isNaN(agentCost({ price: undefined })))
   assert.ok(Number.isNaN(agentCost({})))
+  assert.ok(Number.isNaN(agentCost(null)))
 })
 
 // ─── exceedsBudget: core skip behavior ───────────────────────────
@@ -103,9 +122,8 @@ test('NaN cost (parse failure) does not skip — comparison is false', () => {
 test('NaN budget does not skip — comparison is false', () => {
   assert.strictEqual(exceedsBudget(0, 0.01, NaN), false)
 })
-test('documents floating-point behavior at the 0.1 boundary', () => {
-  // 0.07 + 0.03 === 0.09999999999999999 in IEEE-754, which is NOT > 0.1.
-  assert.strictEqual(0.07 + 0.03 > 0.1, false)
+test('documents exact accounting at the 0.1 boundary without IEEE-754 drift', () => {
+  // 0.07 + 0.03 === 0.10 exactly in integer base units (700000n + 300000n === 1000000n).
   assert.strictEqual(exceedsBudget(0.07, 0.03, 0.1), false)
   // ...but it IS > 0.09, so a 0.09 budget correctly skips the step.
   assert.strictEqual(exceedsBudget(0.07, 0.03, 0.09), true)
@@ -114,16 +132,18 @@ test('documents floating-point behavior at the 0.1 boundary', () => {
 // ─── remainingBudget / formatAmount ──────────────────────────────
 console.log('remainingBudget / formatAmount')
 test('remainingBudget can go negative when overspent', () => {
-  // Raw subtraction carries IEEE-754 noise (0.05 - 0.03 = 0.0200000000…4),
-  // which is exactly why production only ever surfaces it via formatAmount.
   assert.strictEqual(formatAmount(remainingBudget(0.05, 0.03)), '0.0200')
   assert.strictEqual(formatAmount(remainingBudget(0.05, 0.06)), '-0.0100')
-  assert.strictEqual(remainingBudget(0.05, 0.06) < 0, true)
+  const rem = remainingBudget(0.05, 0.06)
+  assert.strictEqual(rem < 0, true)
+  assert.ok(rem instanceof AssetAmount)
+  assert.strictEqual(rem.isNegative(), true)
 })
-test('formatAmount always renders 4 decimal places', () => {
+test('formatAmount always renders 4 decimal places by default', () => {
   assert.strictEqual(formatAmount(0.01), '0.0100')
   assert.strictEqual(formatAmount(0), '0.0000')
   assert.strictEqual(formatAmount(-0.01), '-0.0100')
+  assert.strictEqual(formatAmount(AssetAmount.from('0.01')), '0.0100')
 })
 
 // ─── buildSkipResult: skipped-step reporting ─────────────────────
@@ -151,7 +171,6 @@ test('builds a budget_limit event without a timestamp', () => {
     cost: '0.05',
     remaining: '0.0400',
   })
-  // Timestamp is added by the orchestrator so the pure payload stays deterministic.
   assert.strictEqual('timestamp' in ev, false)
 })
 
@@ -222,8 +241,6 @@ test('counts used vs skipped across a mixed results array', () => {
   assert.strictEqual(countSkipped(results), 1)
 })
 test('an "agent not found" error entry counts as used (pins current behavior)', () => {
-  // orchestrator pushes { agentId, error } with no `skipped` flag; today that
-  // entry is counted among agentsUsed. Documented here so a fix is intentional.
   const results = [{ agentId: 'ghost-bot', error: 'Agent not found' }]
   assert.strictEqual(countUsed(results), 1)
   assert.strictEqual(countSkipped(results), 0)
@@ -234,20 +251,19 @@ test('empty results yield zero used and zero skipped', () => {
 })
 
 // ─── Integration: deterministic end-to-end budget run ────────────
-// Mirrors orchestrate()'s loop using the exported helpers to prove the pieces
-// compose into correct overrun prevention + summary, without any SDK/network.
 console.log('integration: simulated budget run')
 function simulateRun(agents, budget, paidViaFor = () => 'x402') {
   const results = []
-  let totalSpent = 0
+  let totalSpent = AssetAmount.zero('USDC')
+  const exactBudget = AssetAmount.from(budget, 'USDC')
   const paidViaList = []
   for (const agent of agents) {
     const cost = agentCost(agent)
-    if (exceedsBudget(totalSpent, cost, budget)) {
-      results.push(buildSkipResult(agent, budget, totalSpent))
+    if (exceedsBudget(totalSpent, cost, exactBudget)) {
+      results.push(buildSkipResult(agent, exactBudget, totalSpent))
       continue
     }
-    totalSpent += cost
+    totalSpent = totalSpent.plus(cost)
     const paidVia = paidViaFor(agent)
     paidViaList.push(paidVia)
     results.push({ agentId: agent.id, skipped: false, paidVia })
@@ -255,7 +271,8 @@ function simulateRun(agents, budget, paidViaFor = () => 'x402') {
   const { x402PaymentCount, xlmFallbackCount, unpaidCount } = tallyPaymentOutcomes(paidViaList)
   return {
     totalSpent: formatAmount(totalSpent),
-    budgetExhausted: isBudgetExhausted(totalSpent, budget),
+    totalSpentExact: totalSpent.toJSON(),
+    budgetExhausted: isBudgetExhausted(totalSpent, exactBudget),
     agentsUsed: countUsed(results),
     agentsSkipped: countSkipped(results),
     paymentProtocol: paymentProtocolSummary(x402PaymentCount, xlmFallbackCount),
@@ -302,6 +319,249 @@ test('mixed payment outcomes produce a mixed protocol summary', () => {
   assert.strictEqual(out.xlmFallbackCount, 1)
   assert.strictEqual(out.unpaidCount, 0)
   assert.strictEqual(out.paymentProtocol, 'mixed')
+})
+
+// ─── Scope & Validation per Issue #129 ────────────────────────────
+
+// 1. Repeated small amounts
+console.log('exact accounting: repeated small amounts')
+test('repeated additions of 0.01 USDC avoid IEEE-754 drift', () => {
+  // In IEEE-754 floats: 0.01 * 10 is 0.09999999999999999
+  let floatSum = 0
+  for (let i = 0; i < 10; i++) floatSum += 0.01
+  assert.notStrictEqual(floatSum, 0.1) // proves float imperfection
+
+  // With exact base units (100,000 stroops * 10 = 1,000,000 stroops = 0.1000000)
+  let exactSum = AssetAmount.zero('USDC')
+  const step = AssetAmount.from('0.01', 'USDC')
+  for (let i = 0; i < 10; i++) {
+    exactSum = exactSum.plus(step)
+  }
+  assert.strictEqual(exactSum.baseUnits, 1000000n)
+  assert.strictEqual(exactSum.toExactString(), '0.1')
+  assert.strictEqual(exactSum.toDecimalString(7), '0.1000000')
+  assert.strictEqual(exactSum.equals(AssetAmount.from('0.1', 'USDC')), true)
+})
+
+test('repeated additions of 100 steps of 0.001 USDC produce exact 0.1000000', () => {
+  let sum = AssetAmount.zero('USDC')
+  const microStep = AssetAmount.from('0.001', 'USDC')
+  for (let i = 0; i < 100; i++) {
+    sum = sum.plus(microStep)
+  }
+  assert.strictEqual(sum.baseUnits, 1000000n)
+  assert.strictEqual(sum.toDecimalString(4), '0.1000')
+})
+
+test('repeated additions of 1 stroop (0.0000001) scale losslessly', () => {
+  let sum = AssetAmount.zero('USDC')
+  const oneStroop = AssetAmount.fromBaseUnits(1n, 'USDC')
+  for (let i = 0; i < 10000; i++) {
+    sum = sum.plus(oneStroop)
+  }
+  assert.strictEqual(sum.baseUnits, 10000n)
+  assert.strictEqual(sum.toDecimalString(7), '0.0010000')
+  assert.strictEqual(sum.toExactString(), '0.001')
+})
+
+// 2. Exact equality
+console.log('exact accounting: exact equality')
+test('exact-budget plan is accepted and consumes budget completely', () => {
+  const budget = AssetAmount.from('0.05', 'USDC')
+  const cost = AssetAmount.from('0.05', 'USDC')
+
+  // Step must be accepted when cost === remaining budget (strict >)
+  assert.strictEqual(exceedsBudget(0, cost, budget), false)
+
+  const remaining = remainingBudget(budget, cost)
+  assert.ok(remaining instanceof AssetAmount)
+  assert.strictEqual(remaining.baseUnits, 0n)
+  assert.strictEqual(remaining.isZero(), true)
+  assert.strictEqual(isBudgetExhausted(cost, budget), true)
+})
+
+test('multi-step plan consuming exact budget succeeds without premature cutoff', () => {
+  // 0.01 + 0.01 + 0.05 + 0.03 === 0.10 exact
+  const out = simulateRun([research, summary, analyst, code], 0.1)
+  assert.strictEqual(out.agentsUsed, 4)
+  assert.strictEqual(out.agentsSkipped, 0)
+  assert.strictEqual(out.totalSpent, '0.1000')
+  assert.strictEqual(out.budgetExhausted, true)
+})
+
+// 3. One-unit differences
+console.log('exact accounting: one-unit differences')
+test('plan one supported unit over budget is rejected', () => {
+  // For USDC (precision 7), 1 supported unit is 1 stroop = 0.0000001
+  const budget = AssetAmount.from('0.0500000', 'USDC') // 500,000 stroops
+  const exactCost = AssetAmount.from('0.0500000', 'USDC') // 500,000 stroops
+  const oneUnitOver = AssetAmount.from('0.0500001', 'USDC') // 500,001 stroops
+  const oneUnitUnder = AssetAmount.from('0.0499999', 'USDC') // 499,999 stroops
+
+  // Exact cost is accepted
+  assert.strictEqual(exceedsBudget(0, exactCost, budget), false)
+
+  // One unit under is accepted
+  assert.strictEqual(exceedsBudget(0, oneUnitUnder, budget), false)
+
+  // One unit over is rejected
+  assert.strictEqual(exceedsBudget(0, oneUnitOver, budget), true)
+})
+
+test('cumulative spend respects one-unit boundary across multiple steps', () => {
+  const budget = AssetAmount.from('0.0500000', 'USDC')
+  const spentPrior = AssetAmount.from('0.0499999', 'USDC')
+  const stepOneStroop = AssetAmount.from('0.0000001', 'USDC')
+  const stepTwoStroops = AssetAmount.from('0.0000002', 'USDC')
+
+  // Prior spend + 1 stroop = exact budget -> accepted
+  assert.strictEqual(exceedsBudget(spentPrior, stepOneStroop, budget), false)
+
+  // Prior spend + 2 stroops = 1 stroop over budget -> rejected
+  assert.strictEqual(exceedsBudget(spentPrior, stepTwoStroops, budget), true)
+})
+
+// 4. Unsupported fractional precision
+console.log('exact accounting: unsupported fractional precision')
+test('unsupported fractional precision returns a defined validation error', () => {
+  // USDC allows at most 7 decimals (1 stroop)
+  assert.throws(
+    () => AssetAmount.from('0.01000001', 'USDC'), // 8 decimals
+    (err) => {
+      assert.ok(err instanceof UnsupportedPrecisionError)
+      assert.strictEqual(err.code, 'UNSUPPORTED_PRECISION')
+      assert.strictEqual(err.details.maxPrecision, 7)
+      assert.strictEqual(err.details.receivedPrecision, 8)
+      assert.strictEqual(err.status, 400)
+      return true
+    }
+  )
+
+  assert.throws(
+    () => AssetAmount.from('0.00000001', 'USDC'), // 8 decimals
+    (err) => {
+      assert.strictEqual(err.code, 'UNSUPPORTED_PRECISION')
+      return true
+    }
+  )
+})
+
+test('per-asset custom precision enforces configured limits', () => {
+  try {
+    registerAsset('FIAT_USD', 2)
+    registerAsset('MICRO', 4)
+
+    // FIAT_USD allows 2 decimals
+    const validFiat = AssetAmount.from('12.50', 'FIAT_USD')
+    assert.strictEqual(validFiat.baseUnits, 1250n)
+    assert.strictEqual(validFiat.precision, 2)
+
+    // 3 decimals on 2-decimal asset throws
+    assert.throws(
+      () => AssetAmount.from('12.505', 'FIAT_USD'),
+      (err) => {
+        assert.ok(err instanceof UnsupportedPrecisionError)
+        assert.strictEqual(err.details.maxPrecision, 2)
+        assert.strictEqual(err.details.receivedPrecision, 3)
+        return true
+      }
+    )
+
+    // MICRO allows 4 decimals
+    const validMicro = AssetAmount.from('0.0001', 'MICRO')
+    assert.strictEqual(validMicro.baseUnits, 1n)
+
+    // 5 decimals throws
+    assert.throws(
+      () => AssetAmount.from('0.00001', 'MICRO'),
+      (err) => err instanceof UnsupportedPrecisionError
+    )
+  } finally {
+    resetCustomAssets()
+  }
+})
+
+test('malformed amount strings throw InvalidAmountError', () => {
+  assert.throws(
+    () => AssetAmount.from('not-a-number'),
+    (err) => err instanceof InvalidAmountError
+  )
+  assert.throws(
+    () => AssetAmount.from(''),
+    (err) => err instanceof InvalidAmountError
+  )
+  assert.throws(
+    () => AssetAmount.from('   '),
+    (err) => err instanceof InvalidAmountError
+  )
+  assert.throws(
+    () => AssetAmount.from('0.1.2'),
+    (err) => err instanceof InvalidAmountError
+  )
+})
+
+// 5. JSON-safe serialization and round trips
+console.log('exact accounting: JSON round trips & compatibility contract')
+test('AssetAmount produces JSON-safe structured representation without BigInt errors', () => {
+  const amt = AssetAmount.from('0.0500001', 'USDC')
+  const json = JSON.stringify(amt)
+
+  // Standard JSON.stringify works (no TypeError: Do not know how to serialize a BigInt)
+  assert.strictEqual(typeof json, 'string')
+  const parsed = JSON.parse(json)
+
+  assert.deepStrictEqual(parsed, {
+    amount: '0.0500001',
+    baseUnits: '500001',
+    asset: 'USDC',
+    precision: 7,
+  })
+
+  // Full round trip reconstitution
+  const reconstituted = AssetAmount.from(parsed)
+  assert.strictEqual(reconstituted.baseUnits, amt.baseUnits)
+  assert.strictEqual(reconstituted.asset, amt.asset)
+  assert.strictEqual(reconstituted.precision, amt.precision)
+  assert.strictEqual(reconstituted.equals(amt), true)
+})
+
+test('round trips preserve zero, 1 stroop, large, and negative values', () => {
+  const fixtures = [
+    '0.0000000',
+    '0.0000001', // 1 stroop
+    '0.0100000',
+    '0.0500000',
+    '1000000.1234567',
+    '-0.0100000',
+  ]
+  for (const f of fixtures) {
+    const original = AssetAmount.from(f, 'USDC')
+    const jsonStr = JSON.stringify(original)
+    const reconstituted = AssetAmount.from(JSON.parse(jsonStr))
+    assert.strictEqual(
+      reconstituted.baseUnits,
+      original.baseUnits,
+      `Base units mismatch for fixture: ${f}`
+    )
+    assert.strictEqual(reconstituted.toDecimalString(7), original.toDecimalString(7))
+  }
+})
+
+test('orchestrator result object round-trips through JSON without network calls', () => {
+  const out = simulateRun([research, summary], 0.05)
+  const json = JSON.stringify(out)
+  const parsed = JSON.parse(json)
+
+  assert.strictEqual(parsed.totalSpent, '0.0200')
+  assert.deepStrictEqual(parsed.totalSpentExact, {
+    amount: '0.0200000',
+    baseUnits: '200000',
+    asset: 'USDC',
+    precision: 7,
+  })
+
+  const fromParsed = AssetAmount.from(parsed.totalSpentExact)
+  assert.strictEqual(fromParsed.baseUnits, 200000n)
 })
 
 // ─── Report ──────────────────────────────────────────────────────

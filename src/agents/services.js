@@ -1,5 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { config } from '../config.js'
+import { usageFromMessage, unavailableUsage } from './usage.js'
+import { normalizeContent } from './response-normalization.js'
 
 export let anthropic = new Anthropic({ apiKey: config.anthropicApiKey })
 
@@ -205,6 +207,7 @@ This function handles a basic Stellar payment operation suitable for agent-to-ag
 async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, options = {}) {
   if (!config.anthropicApiKey) {
     console.log('  ℹ️  No API key — using demo response')
+    options.onUsage?.(unavailableUsage(model, 'no_api_key'))
     return fallbackFn(fallbackInput)
   }
 
@@ -220,7 +223,24 @@ async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, o
       }
     )
     claudeAvailable = true
-    return msg.content[0].type === 'text' ? msg.content[0].text : ''
+    options.onUsage?.(usageFromMessage(msg, model))
+
+    // Combine every text block (not just content[0]) and surface
+    // stop/completion metadata so callers can tell a truncated or empty
+    // response apart from a normal, complete one.
+    const normalized = normalizeContent(msg)
+    options.onResponseMeta?.(normalized)
+    if (normalized.truncated) {
+      console.warn(`  WARNING: Claude response truncated at token limit (model: ${model})`)
+    }
+    if (normalized.empty) {
+      console.warn(
+        `  WARNING: Claude response had no text content (model: ${model}, blocks: ${
+          normalized.blockTypes.join(', ') || 'none'
+        })`
+      )
+    }
+    return normalized.text
   } catch (err) {
     console.error(`Claude API error: ${err.message}`)
     if (
@@ -232,8 +252,10 @@ async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, o
         console.log('  ⚠️  Claude API credits exhausted — switching to demo responses')
         claudeAvailable = false
       }
+      options.onUsage?.(unavailableUsage(model, 'credits_exhausted_fallback'))
       return fallbackFn(fallbackInput)
     }
+    options.onUsage?.(unavailableUsage(model, 'error'))
     throw err
   }
 }

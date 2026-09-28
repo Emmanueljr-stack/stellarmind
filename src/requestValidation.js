@@ -1,3 +1,5 @@
+import { AssetAmount, getAssetPrecision, DEFAULT_ASSET } from './agents/amount.js'
+
 const DEFAULT_BUDGET = 0.15
 const MAX_TOPIC_LENGTH = 500
 const MAX_SUMMARY_TEXT_LENGTH = 5000
@@ -74,15 +76,17 @@ function assertStringField(
   }
 }
 
-function assertBudget(value) {
+function assertBudget(value, asset = DEFAULT_ASSET) {
   if (value === undefined || value === null || value === '') {
     return {
       valid: true,
       value: DEFAULT_BUDGET,
+      amount: AssetAmount.from(DEFAULT_BUDGET, asset),
     }
   }
 
-  const parsed = Number(value)
+  const str = String(value).trim()
+  const parsed = Number(str)
   if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
     return {
       valid: false,
@@ -105,9 +109,42 @@ function assertBudget(value) {
     }
   }
 
+  const maxPrecision = getAssetPrecision(asset)
+  const parts = str.split('.')
+  if (parts.length === 2 && parts[1].length > maxPrecision) {
+    return {
+      valid: false,
+      error: {
+        field: 'budget',
+        reason: `Unsupported fractional precision: asset '${asset}' allows at most ${maxPrecision} decimal places, received ${parts[1].length} decimal places in '${value}'`,
+        code: 'UNSUPPORTED_PRECISION',
+        asset,
+        maxPrecision,
+        receivedPrecision: parts[1].length,
+        received: value,
+      },
+    }
+  }
+
+  let exactAmount
+  try {
+    exactAmount = AssetAmount.from(str, asset)
+  } catch (err) {
+    return {
+      valid: false,
+      error: {
+        field: 'budget',
+        reason: err.message,
+        code: err.code || 'INVALID_INPUT',
+        received: value,
+      },
+    }
+  }
+
   return {
     valid: true,
     value: parsed,
+    amount: exactAmount,
   }
 }
 
@@ -196,7 +233,7 @@ function validatePremiumQuery(req, _res, next) {
 }
 
 function validateOrchestrate(req, _res, next) {
-  const source = req.method === 'GET' ? req.query : req.body
+  const source = (req.method === 'GET' ? req.query : req.body) || {}
   const taskResult = assertStringField('task', source.task, {
     required: true,
     minLength: 1,
@@ -208,6 +245,57 @@ function validateOrchestrate(req, _res, next) {
   if (!taskResult.valid) details.push(taskResult.error)
   if (!budgetResult.valid) details.push(budgetResult.error)
 
+  let mode = 'sync'
+  // Check body first, then query string, then Prefer header
+  const modeValue = source.mode ?? req.query?.mode
+  const asyncValue = source.async ?? req.query?.async
+  if (modeValue !== undefined) {
+    if (typeof modeValue !== 'string' || !['sync', 'async'].includes(modeValue.toLowerCase())) {
+      details.push({
+        field: 'mode',
+        reason: "Submission mode must be either 'sync' or 'async'",
+        received: modeValue,
+      })
+    } else {
+      mode = modeValue.toLowerCase()
+    }
+  } else if (asyncValue !== undefined) {
+    if (asyncValue === true || asyncValue === 'true') {
+      mode = 'async'
+    } else if (asyncValue === false || asyncValue === 'false') {
+      mode = 'sync'
+    } else {
+      details.push({
+        field: 'async',
+        reason: "Parameter 'async' must be a boolean",
+        received: asyncValue,
+      })
+    }
+  } else if (
+    typeof req.header === 'function' &&
+    req.header('prefer')?.toLowerCase().includes('respond-async')
+  ) {
+    mode = 'async'
+  }
+
+  const headerKey =
+    typeof req.header === 'function'
+      ? req.header('idempotency-key') || req.header('x-idempotency-key')
+      : undefined
+  const rawKey = headerKey !== undefined ? headerKey : source.idempotencyKey
+  let idempotencyKey = null
+  if (rawKey !== undefined && rawKey !== null) {
+    if (typeof rawKey !== 'string' || rawKey.trim().length === 0 || rawKey.length > 256) {
+      details.push({
+        field: 'idempotencyKey',
+        reason: 'Idempotency key must be a non-empty string with at most 256 characters',
+        received: rawKey,
+      })
+    } else {
+      idempotencyKey = rawKey.trim()
+    }
+  }
+
   if (details.length > 0) {
     return next(validationError('Invalid orchestrate request', details))
   }
@@ -216,6 +304,8 @@ function validateOrchestrate(req, _res, next) {
     ...req.validated,
     task: taskResult.value,
     budget: budgetResult.value,
+    mode,
+    idempotencyKey,
   }
   next()
 }

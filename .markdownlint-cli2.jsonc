@@ -15,8 +15,11 @@
     // 4-backtick fences around content that itself contains ```.
     "MD046": { "style": "fenced" },
     // Prettier owns table formatting (aligned pipes/padding); don't double-enforce.
-    "MD060": false
+    "MD060": false,
+    // Allow emphasis formatting for document footers and notes.
+    "MD036": false,
+    // Allow generic code blocks without language tag.
+    "MD040": false,
   },
-  "globs": ["**/*.md"],
-  "ignores": ["node_modules/**", ".git/**", "coverage/**", "dist/**", ".github/**"]
+  "ignores": ["node_modules/**", ".git/**", "coverage/**", "dist/**", ".github/**"],
 }

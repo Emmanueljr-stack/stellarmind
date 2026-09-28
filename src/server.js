@@ -16,17 +16,15 @@ import {
   MODEL_LABELS,
 } from './agents/services.js'
 import { orchestrate } from './agents/orchestrator.js'
+import { OrchestrationAdmissionQueue } from './agents/orchestration-queue.js'
 import { getBalance, getTransactions } from './stellar/wallet.js'
 import { requestId, requestLogger, errorHandler } from './middleware/errorHandler.js'
 import { apikeyLimiter } from './middleware/rateLimiter.js'
-import {
-  validatePremiumQuery,
-  validateOrchestrate,
-  validateWalletTransactions,
-} from './requestValidation.js'
+import { validatePremiumQuery, validateWalletTransactions } from './requestValidation.js'
 import { logger } from './logger.js'
 import { adminAuth } from './middleware/auth.js'
 import { registerPremiumRoutes } from './routes/premium-routes.js'
+import { registerOrchestrationRoutes } from './routes/orchestration-routes.js'
 import { createRunHistoryStore } from './storage/run-history.js'
 
 // x402 imports
@@ -62,6 +60,7 @@ app.use(requestLogger)
 const sseClients = []
 let x402MiddlewareReady = false
 const runHistoryStore = await createRunHistoryStore(config)
+const admissionQueue = new OrchestrationAdmissionQueue(config.orchestrationQueue)
 
 function broadcast(event) {
   const data = JSON.stringify(event)
@@ -368,85 +367,12 @@ app.get('/api/code', async (req, res, next) => {
   }
 })
 
-// ─── Orchestrator Endpoint ───────────────────────────────────
-app.post('/api/orchestrate', validateOrchestrate, async (req, res, next) => {
-  try {
-    const { task, budget } = req.validated
-    const run = await runHistoryStore.createRun({
-      task,
-      budget,
-      source: 'POST /api/orchestrate',
-    })
-    const runBroadcast = (event) => {
-      const eventWithRun = { ...event, runId: run.id }
-      broadcast(eventWithRun)
-      runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
-        logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
-      })
-    }
-
-    let result
-    try {
-      result = await orchestrate(task, budget, runBroadcast, { correlationId: req.requestId })
-      await runHistoryStore.completeRun(run.id, result)
-    } catch (err) {
-      await runHistoryStore.failRun(run.id, err)
-      throw err
-    }
-
-    result.runId = run.id
-    res.json(result)
-  } catch (err) {
-    next(err)
-  }
-})
-
-// Also support GET for easy testing
-app.get('/api/orchestrate', validateOrchestrate, async (req, res, next) => {
-  try {
-    const { task, budget } = req.validated
-    const run = await runHistoryStore.createRun({
-      task,
-      budget,
-      source: 'GET /api/orchestrate',
-    })
-    const runBroadcast = (event) => {
-      const eventWithRun = { ...event, runId: run.id }
-      broadcast(eventWithRun)
-      runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
-        logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
-      })
-    }
-
-    let result
-    try {
-      result = await orchestrate(task, budget, runBroadcast, { correlationId: req.requestId })
-      await runHistoryStore.completeRun(run.id, result)
-    } catch (err) {
-      await runHistoryStore.failRun(run.id, err)
-      throw err
-    }
-
-    result.runId = run.id
-    res.json(result)
-  } catch (err) {
-    next(err)
-  }
-})
-
-app.get('/api/runs', async (req, res, next) => {
-  try {
-    const limit = req.query.limit || 20
-    const runs = await runHistoryStore.listRecent(limit)
-    res.json({
-      storage: config.runHistoryStorage,
-      file: config.runHistoryStorage === 'file' ? config.runHistoryFile : null,
-      count: runs.length,
-      runs,
-    })
-  } catch (err) {
-    next(err)
-  }
+// ─── Orchestrator Endpoint (sync + async modes) ─────────────
+registerOrchestrationRoutes(app, {
+  runHistoryStore,
+  orchestrate,
+  broadcast,
+  admissionQueue,
 })
 
 // ─── Agent Registry Endpoints ────────────────────────────────
@@ -582,6 +508,11 @@ app.get('/api/status', (req, res) => {
       buyer: config.buyerAddress ? `${config.buyerAddress.slice(0, 8)}...` : 'not configured',
     },
     claudeEnabled: !!config.anthropicApiKey,
+    orchestrationQueue: {
+      ...admissionQueue.getState(),
+      multiReplicaCoordination: false,
+      note: 'In-process admission queue bounds concurrency on this node; no cross-node distributed coordination.',
+    },
     runHistory: {
       storage: config.runHistoryStorage,
       file: config.runHistoryStorage === 'file' ? config.runHistoryFile : null,
@@ -622,9 +553,13 @@ app.get('/', (req, res) => {
 app.use(errorHandler)
 
 // ─── Start Server ────────────────────────────────────────────
-const PORT = config.port
-app.listen(PORT, () => {
-  console.log(`
+const isMainModule =
+  process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+
+if (isMainModule) {
+  const PORT = config.port
+  app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════════════╗
 ║         🧠 StellarMind — AI Agent Marketplace     ║
 ║         x402 Micropayments on Stellar Testnet     ║
@@ -639,4 +574,7 @@ app.listen(PORT, () => {
 ║  x402:       ${(config.serverAddress ? '✅ Active' : '⚠️  No wallet').padEnd(34)}║
 ╚══════════════════════════════════════════════════╝
   `)
-})
+  })
+}
+
+export { app, admissionQueue }

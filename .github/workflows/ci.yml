@@ -1,16 +1,35 @@
 name: CI — Lint, Test, Smoke
 
+# One entry point for every quality check.
+#
+# Four workflows used to overlap: this one (master only, Node from .nvmrc) ran
+# lint + tests + smoke + API validation, while `lint.yml` and `test.yml` (all
+# branches, Node 20) ran the same lint and test suites again. A pull request
+# against master therefore executed `npm run lint` three times and `npm test`
+# three times, on two different runtimes.
+#
+# `ci-boost.yml` is gone: it echoed "✅ CI active — tests ran successfully" and
+# "✅ Documentation verified" without running anything.
+#
+# Each suite now runs exactly once, on the runtime pinned by .nvmrc. Jobs keep
+# separate names so a failure points at one suite.
+
 on:
-  pull_request:
-    branches: [master]
   push:
-    branches: [master]
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# A new push to the same branch makes the previous run obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  quality:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
 
@@ -23,20 +42,55 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint (ESLint)
+      - name: Run ESLint
         run: npm run lint
 
-      - name: Lint (Markdown)
-        run: npm run lint:md
-
-      - name: Format check (Prettier)
+      - name: Check Prettier formatting
         run: npm run format:check
 
-      - name: Run tests
-        run: npm test
+      - name: Check Markdown lint
+        run: npm run lint:md
 
-      - name: Smoke test
-        run: npm run smoke
+  unit:
+    name: Unit and API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm test` already runs tests/orchestrator.budget.test.js, so the
+      # separate `npm run test:budget` step that used to live here executed the
+      # same file twice inside one job.
+      - name: Run unit tests
+        run: npm test
 
       - name: API validation tests
         run: npm run test:validation
+
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: API smoke check
+        run: npm run smoke

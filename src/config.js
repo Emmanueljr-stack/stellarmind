@@ -67,10 +67,20 @@ export const config = {
     apikeyWindowSec: Math.max(1, toNumberOr(process.env.RATE_LIMIT_APIKEY_WINDOW_SEC, 60)),
     apikeyMax: Math.max(1, toNumberOr(process.env.RATE_LIMIT_APIKEY_MAX, 5)),
   },
+  // Orchestration Admission Queue (bounds concurrent active runs and pending queue)
+  orchestrationQueue: {
+    maxConcurrent: Math.max(1, toNumberOr(process.env.ORCHESTRATION_MAX_CONCURRENT, 2)),
+    queueCapacity: Math.max(0, toNumberOr(process.env.ORCHESTRATION_QUEUE_CAPACITY, 10)),
+    queueTimeoutMs: Math.max(100, toNumberOr(process.env.ORCHESTRATION_QUEUE_TIMEOUT_MS, 30000)),
+  },
   // Run history persistence
   runHistoryStorage: process.env.RUN_HISTORY_STORAGE || 'file',
   runHistoryFile: process.env.RUN_HISTORY_FILE
     ? path.resolve(process.env.RUN_HISTORY_FILE)
     : path.join(repoRoot, 'data', 'run-history.json'),
   runHistoryMaxRuns: Math.max(10, toNumberOr(process.env.RUN_HISTORY_MAX_RUNS, 200)),
+
+  // Per-transaction operation lookups in getTransactions
+  horizonOpsMaxConcurrency: Math.max(1, toNumberOr(process.env.HORIZON_OPS_MAX_CONCURRENCY, 4)),
+  horizonOpsCacheSize: Math.max(0, toNumberOr(process.env.HORIZON_OPS_CACHE_SIZE, 500)),
 }

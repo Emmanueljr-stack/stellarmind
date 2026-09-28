@@ -28,6 +28,18 @@ COPY --from=builder /app/public ./public
 COPY package*.json ./
 COPY .env.example ./
 
+# Writable state for the non-root runtime user.
+#
+# /app belongs to root, so the stellarmind user cannot create the directory the
+# run history lives in: the store's `mkdir -p` on the default
+# /app/data/run-history.json fails with EACCES and the first run dies. Create
+# the directories as root, hand them to the runtime user, and pin
+# RUN_HISTORY_FILE at the path docker-compose mounts as a volume.
+RUN mkdir -p /app/data /app/logs && \
+    chown -R stellarmind:stellarmind /app/data /app/logs
+
+ENV RUN_HISTORY_FILE=/app/data/run-history.json
+
 # Expose port
 EXPOSE 3000
 

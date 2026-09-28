@@ -7,58 +7,156 @@
  * imports these helpers so the tests guard the *real* code path rather than a
  * re-implementation.
  *
- * All monetary values are USDC. Costs are derived from `agent.price` (a string
- * in the registry), matching the orchestrator's historical behavior.
+ * Uses exact integer base units (AssetAmount) with explicit per-asset precision
+ * for all monetary comparisons, headroom, and totals, avoiding IEEE-754
+ * floating-point inaccuracies.
+ *
+ * All default monetary values are USDC (precision 7, Stellar base units).
+ * Costs are derived from `agent.price` (a string in the registry).
  */
 
+import {
+  AssetAmount,
+  ASSET_PRECISION,
+  DEFAULT_ASSET,
+  UnsupportedPrecisionError,
+  InvalidAmountError,
+  AssetMismatchError,
+  getAssetPrecision,
+  registerAsset,
+  resetCustomAssets,
+} from './amount.js'
+
+export {
+  AssetAmount,
+  ASSET_PRECISION,
+  DEFAULT_ASSET,
+  UnsupportedPrecisionError,
+  InvalidAmountError,
+  AssetMismatchError,
+  getAssetPrecision,
+  registerAsset,
+  resetCustomAssets,
+}
+
 /**
- * Resolve an agent's per-call cost as a number.
- * Returns NaN for malformed prices (preserving `parseFloat` semantics).
- * @param {{ price?: string }} agent
- * @returns {number}
+ * Resolve an agent's per-call cost as an exact AssetAmount.
+ * Returns NaN for malformed prices (preserving legacy guardrail failure behavior).
+ * @param {{ price?: string, currency?: string }} agent
+ * @returns {AssetAmount|number}
  */
 export function agentCost(agent) {
-  return parseFloat(agent?.price)
+  if (
+    !agent ||
+    typeof agent !== 'object' ||
+    agent.price === undefined ||
+    agent.price === null ||
+    agent.price === ''
+  ) {
+    return NaN
+  }
+  try {
+    return AssetAmount.from(agent.price, agent.currency || DEFAULT_ASSET)
+  } catch {
+    return NaN
+  }
 }
 
 /**
- * Remaining budget headroom (may be negative if already overspent).
- * @param {number} budget
- * @param {number} totalSpent
- * @returns {number}
+ * Remaining budget headroom as an AssetAmount (may be negative if already overspent).
+ * Returns NaN if budget or totalSpent is NaN / unparseable.
+ * @param {AssetAmount|number|string} budget
+ * @param {AssetAmount|number|string} totalSpent
+ * @returns {AssetAmount|number}
  */
 export function remainingBudget(budget, totalSpent) {
-  return budget - totalSpent
+  if (
+    (typeof budget === 'number' && Number.isNaN(budget)) ||
+    (typeof totalSpent === 'number' && Number.isNaN(totalSpent)) ||
+    budget === undefined ||
+    budget === null ||
+    totalSpent === undefined ||
+    totalSpent === null
+  ) {
+    return NaN
+  }
+  try {
+    const b = AssetAmount.from(budget)
+    const s = AssetAmount.from(totalSpent)
+    return b.minus(s)
+  } catch {
+    return NaN
+  }
 }
 
 /**
- * Format a USDC amount for display/reporting (4 decimal places).
- * @param {number} value
+ * Format a USDC amount for display/reporting (4 decimal places by default).
+ * Accepts AssetAmount, number, string, or base units bigint.
+ * @param {AssetAmount|number|string|bigint} value
+ * @param {number} [decimals=4]
  * @returns {string}
  */
-export function formatAmount(value) {
-  return Number(value).toFixed(4)
+export function formatAmount(value, decimals = 4) {
+  if (value instanceof AssetAmount) {
+    return value.toDecimalString(decimals)
+  }
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) return 'NaN'
+    return value.toFixed(decimals)
+  }
+  if (typeof value === 'bigint') {
+    return AssetAmount.fromBaseUnits(value).toDecimalString(decimals)
+  }
+  if (typeof value === 'string') {
+    try {
+      return AssetAmount.from(value).toDecimalString(decimals)
+    } catch {
+      return Number(value).toFixed(decimals)
+    }
+  }
+  return Number(value).toFixed(decimals)
 }
 
 /**
  * Core guardrail predicate: would running this step push spend over budget?
  * Strict greater-than means a step whose cost exactly consumes the remaining
  * budget is still allowed to run.
- * @param {number} totalSpent
- * @param {number} cost
- * @param {number} budget
+ * Uses exact integer base units for calculation.
+ * @param {AssetAmount|number|string} totalSpent
+ * @param {AssetAmount|number|string} cost
+ * @param {AssetAmount|number|string} budget
  * @returns {boolean}
  */
 export function exceedsBudget(totalSpent, cost, budget) {
-  return totalSpent + cost > budget
+  if (
+    (typeof cost === 'number' && Number.isNaN(cost)) ||
+    (typeof budget === 'number' && Number.isNaN(budget)) ||
+    (typeof totalSpent === 'number' && Number.isNaN(totalSpent)) ||
+    cost === undefined ||
+    cost === null ||
+    budget === undefined ||
+    budget === null ||
+    totalSpent === undefined ||
+    totalSpent === null
+  ) {
+    return false
+  }
+  try {
+    const spentAmount = AssetAmount.from(totalSpent)
+    const costAmount = AssetAmount.from(cost)
+    const budgetAmount = AssetAmount.from(budget)
+    return spentAmount.plus(costAmount).isGreaterThan(budgetAmount)
+  } catch {
+    return false
+  }
 }
 
 /**
  * Build the skipped-step record pushed onto `results` when a step is denied
  * by the budget guardrail.
  * @param {{ id: string, price: string }} agent
- * @param {number} budget
- * @param {number} totalSpent
+ * @param {AssetAmount|number|string} budget
+ * @param {AssetAmount|number|string} totalSpent
  * @returns {{ agentId: string, skipped: true, reason: string }}
  */
 export function buildSkipResult(agent, budget, totalSpent) {
@@ -73,8 +171,8 @@ export function buildSkipResult(agent, budget, totalSpent) {
  * Build the `budget_limit` broadcast event payload (without a timestamp; the
  * caller is responsible for stamping it so this stays deterministic).
  * @param {{ name: string, price: string }} agent
- * @param {number} budget
- * @param {number} totalSpent
+ * @param {AssetAmount|number|string} budget
+ * @param {AssetAmount|number|string} totalSpent
  * @returns {{ type: 'budget_limit', agent: string, cost: string, remaining: string }}
  */
 export function buildBudgetLimitEvent(agent, budget, totalSpent) {
@@ -130,12 +228,29 @@ export function paymentProtocolSummary(x402Count, xlmFallbackCount) {
 
 /**
  * Whether the budget has been fully consumed (used for the final summary).
- * @param {number} totalSpent
- * @param {number} budget
+ * Uses exact integer base units for comparison.
+ * @param {AssetAmount|number|string} totalSpent
+ * @param {AssetAmount|number|string} budget
  * @returns {boolean}
  */
 export function isBudgetExhausted(totalSpent, budget) {
-  return totalSpent >= budget
+  if (
+    (typeof budget === 'number' && Number.isNaN(budget)) ||
+    (typeof totalSpent === 'number' && Number.isNaN(totalSpent)) ||
+    budget === undefined ||
+    budget === null ||
+    totalSpent === undefined ||
+    totalSpent === null
+  ) {
+    return false
+  }
+  try {
+    const spentAmount = AssetAmount.from(totalSpent)
+    const budgetAmount = AssetAmount.from(budget)
+    return spentAmount.isGreaterThanOrEqualTo(budgetAmount)
+  } catch {
+    return false
+  }
 }
 
 /**

@@ -5,53 +5,53 @@ config:
     - duration: 60
       arrivalRate: 5
       rampTo: 20
-      name: "Warm up"
+      name: 'Warm up'
     - duration: 120
       arrivalRate: 20
       rampTo: 50
-      name: "Ramp up load"
+      name: 'Ramp up load'
     - duration: 60
       arrivalRate: 50
-      name: "Sustained load"
+      name: 'Sustained load'
   ensure:
     thresholds:
       - http.response_time.p99: 2000
       - http.response_time.p95: 1000
     conditions:
-      - expression: "errors.rate < 0.05"
+      - expression: 'errors.rate < 0.05'
 
 scenarios:
-  - name: "Health check"
+  - name: 'Health check'
     flow:
       - get:
-          url: "/api/health"
+          url: '/api/health'
           expect:
             - statusCode: 200
 
-  - name: "Pricing endpoint"
+  - name: 'Pricing endpoint'
     flow:
       - get:
-          url: "/api/pricing"
+          url: '/api/pricing'
           expect:
             - statusCode:
                 - 200
                 - 404
 
-  - name: "Orchestrator status"
+  - name: 'Orchestrator status'
     flow:
       - get:
-          url: "/api/orchestrator/status"
+          url: '/api/orchestrator/status'
           expect:
             - statusCode:
                 - 200
                 - 404
 
-  - name: "SSE simulation (homepage)"
+  - name: 'SSE simulation (homepage)'
     flow:
       - get:
-          url: "/"
+          url: '/'
           expect:
             - statusCode: 200
       - think: 1
       - get:
-          url: "/api/health"
+          url: '/api/health'

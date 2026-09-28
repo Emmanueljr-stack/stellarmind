@@ -225,3 +225,5 @@ Driven by environment variables (see [`.env.example`](../.env.example) and
 
 - [README](../README.md) — overview, quick start, and operational health checks
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — design decisions and how to add a new agent
+- [ASSET_AMOUNTS.md](ASSET_AMOUNTS.md) — exact asset amounts, integer base units, and budget
+  accounting contract

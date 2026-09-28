@@ -27,9 +27,12 @@ User → Orchestrator (Claude plans tasks)
    client rather than building custom payment verification. This ensures compatibility with the x402
    ecosystem.
 
-2. **Budget enforcement in the orchestrator**: The orchestrator checks `totalSpent + cost > budget`
-   before each agent call. If exceeded, the agent is skipped. This demonstrates programmable
-   spending policies.
+2. **Budget enforcement with exact asset accounting**: The orchestrator checks
+   `totalSpent + cost > budget` before each agent call using integer base units (`AssetAmount` in
+   [`src/agents/amount.js`](src/agents/amount.js)), with strict precision admission and zero
+   floating-point drift (see [`docs/ASSET_AMOUNTS.md`](docs/ASSET_AMOUNTS.md)). If exceeded, the
+   agent is skipped. This demonstrates programmable spending policies with exact financial
+   accounting.
 
 3. **Dual payment mode**: The system attempts x402 USDC payments first, then falls back to XLM
    direct transfers. Both produce real, verifiable on-chain transactions.
