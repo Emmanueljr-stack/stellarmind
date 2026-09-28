@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { validateOrchestrate } from '../requestValidation.js'
 import { logger } from '../logger.js'
 import { config } from '../config.js'
+import { OrchestrationAdmissionQueue } from '../agents/orchestration-queue.js'
 
 export function registerOrchestrationRoutes(app, deps = {}) {
   const {
@@ -11,15 +12,28 @@ export function registerOrchestrationRoutes(app, deps = {}) {
     // Optional read-only probe: (attempt) => { settled, txHash?, proof? }.
     // See the reconcile endpoint below and docs/architecture.md (#131).
     paymentProbe,
+    admissionQueue = new OrchestrationAdmissionQueue(config.orchestrationQueue),
   } = deps
 
   const activeExecutions = new Map() // runId -> Promise<result>
   const inFlightIdempotentRequests = new Map() // key -> Promise<{ run, fingerprint }>
 
   async function handleSubmission(req, res, next) {
+    const isAsync = req.validated?.mode === 'async'
+    const clientAbortController = new AbortController()
+    const onClose = () => {
+      if (!res.writableEnded) {
+        clientAbortController.abort(new Error('Client disconnected'))
+      }
+    }
+
+    if (!isAsync) {
+      res.on('close', onClose)
+      req.on('aborted', onClose)
+    }
+
     try {
-      const { task, budget, mode, idempotencyKey } = req.validated
-      const isAsync = mode === 'async'
+      const { task, budget, idempotencyKey } = req.validated
       const source = `${req.method} /api/orchestrate`
 
       const fingerprint = idempotencyKey
@@ -124,17 +138,49 @@ export function registerOrchestrationRoutes(app, deps = {}) {
         }
       }
 
-      // 4. Detached background execution promise
+      // 4. Detached background execution promise with admission queue
+      let queueSubmissionError = null
       const executionPromise = (async () => {
         try {
-          const result = await orchestrateFn(task, budget, runBroadcast, {
-            correlationId: req.requestId,
-            // Links every payment attempt to this run, and lets the
-            // orchestrator reconcile an unresolved outcome *before* it
-            // decides whether a fallback settlement is permitted (#131).
-            runId: run.id,
-            paymentProbe,
-          })
+          const result = await admissionQueue.run(
+            async ({ signal }) => {
+              return orchestrateFn(task, budget, runBroadcast, {
+                correlationId: req.requestId,
+                // Links every payment attempt to this run, and lets the
+                // orchestrator reconcile an unresolved outcome *before* it
+                // decides whether a fallback settlement is permitted (#131).
+                runId: run.id,
+                paymentProbe,
+                signal,
+              })
+            },
+            {
+              id: run.id,
+              signal: isAsync ? undefined : clientAbortController.signal,
+              onQueued: ({ position, queueLength, activeCount }) => {
+                runBroadcast({
+                  type: 'orchestration_queued',
+                  runId: run.id,
+                  position,
+                  queueLength,
+                  activeCount,
+                  timestamp: new Date().toISOString(),
+                })
+              },
+              onAdmitted: ({ waitDurationMs, activeCount, queued }) => {
+                if (queued) {
+                  runBroadcast({
+                    type: 'orchestration_admitted',
+                    runId: run.id,
+                    waitDurationMs,
+                    activeCount,
+                    timestamp: new Date().toISOString(),
+                  })
+                }
+              },
+            }
+          )
+
           result.runId = run.id
           await runHistoryStore.completeRun(run.id, result)
           return result
@@ -149,14 +195,29 @@ export function registerOrchestrationRoutes(app, deps = {}) {
           throw err
         } finally {
           activeExecutions.delete(run.id)
+          if (!isAsync) {
+            res.off?.('close', onClose)
+            req.off?.('aborted', onClose)
+          }
         }
       })()
 
       activeExecutions.set(run.id, executionPromise)
 
+      // Catch immediate queue rejection (e.g. QueueCapacityExceededError)
+      executionPromise.catch((err) => {
+        queueSubmissionError = err
+      })
+
+      // Yield to allow synchronous queue capacity check to reject if full
+      await Promise.resolve()
+
+      if (queueSubmissionError) {
+        return next(queueSubmissionError)
+      }
+
       // 5. Return outcome according to submission mode
       if (isAsync) {
-        executionPromise.catch(() => {}) // Prevent unhandled rejection
         res.setHeader('Location', `/api/runs/${run.id}`)
         if (req.header('prefer')?.toLowerCase().includes('respond-async')) {
           res.setHeader('Preference-Applied', 'respond-async')
@@ -239,6 +300,56 @@ export function registerOrchestrationRoutes(app, deps = {}) {
   // ─── Endpoints ──────────────────────────────────────────────
   app.post('/api/orchestrate', validateOrchestrate, handleSubmission)
   app.get('/api/orchestrate', validateOrchestrate, handleSubmission)
+
+  app.get('/api/orchestrate/queue', (req, res) => {
+    res.json({
+      ...admissionQueue.getState(),
+      multiReplicaCoordination: false,
+      note: 'In-process admission queue bounds concurrency on this server instance; no cross-node distributed coordination.',
+      retryAfterDefaultSec: Math.max(1, Math.ceil(admissionQueue.queueTimeoutMs / 1000)),
+    })
+  })
+
+  app.post('/api/orchestrate/:id/cancel', async (req, res, next) => {
+    try {
+      const { id } = req.params
+      const reason = req.body?.reason || 'User cancelled orchestration'
+      const cancelResult = admissionQueue.cancel(id, reason)
+
+      if (cancelResult.cancelled) {
+        broadcast({
+          type: 'orchestration_cancelled',
+          runId: id,
+          phase: cancelResult.phase,
+          reason,
+          timestamp: new Date().toISOString(),
+        })
+        return res.json({
+          success: true,
+          runId: id,
+          phase: cancelResult.phase,
+          message: `Orchestration run ${id} was cancelled (${cancelResult.phase} phase)`,
+        })
+      }
+
+      const run = await runHistoryStore.getRun(id)
+      if (!run) {
+        const err = new Error(`Orchestration run ${id} not found`)
+        err.status = 404
+        err.code = 'NOT_FOUND'
+        return next(err)
+      }
+
+      return res.status(409).json({
+        success: false,
+        runId: id,
+        status: run.status,
+        message: `Run ${id} cannot be cancelled because it is already ${run.status}`,
+      })
+    } catch (err) {
+      next(err)
+    }
+  })
 
   app.get('/api/runs', async (req, res, next) => {
     try {

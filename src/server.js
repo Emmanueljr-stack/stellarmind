@@ -16,6 +16,7 @@ import {
   MODEL_LABELS,
 } from './agents/services.js'
 import { orchestrate } from './agents/orchestrator.js'
+import { OrchestrationAdmissionQueue } from './agents/orchestration-queue.js'
 import { getBalance, getTransactions } from './stellar/wallet.js'
 import { requestId, requestLogger, errorHandler } from './middleware/errorHandler.js'
 import { apikeyLimiter } from './middleware/rateLimiter.js'
@@ -59,6 +60,7 @@ app.use(requestLogger)
 const sseClients = []
 let x402MiddlewareReady = false
 const runHistoryStore = await createRunHistoryStore(config)
+const admissionQueue = new OrchestrationAdmissionQueue(config.orchestrationQueue)
 
 function broadcast(event) {
   const data = JSON.stringify(event)
@@ -370,6 +372,7 @@ registerOrchestrationRoutes(app, {
   runHistoryStore,
   orchestrate,
   broadcast,
+  admissionQueue,
   // Optional: inject a read-only probe (attempt) => { settled, txHash, proof }
   // to reconcile unresolved payment attempts before any fallback settlement
   // is permitted. Without one, unknown attempts stay visibly pending (#131).
@@ -508,6 +511,11 @@ app.get('/api/status', (req, res) => {
       buyer: config.buyerAddress ? `${config.buyerAddress.slice(0, 8)}...` : 'not configured',
     },
     claudeEnabled: !!config.anthropicApiKey,
+    orchestrationQueue: {
+      ...admissionQueue.getState(),
+      multiReplicaCoordination: false,
+      note: 'In-process admission queue bounds concurrency on this node; no cross-node distributed coordination.',
+    },
     runHistory: {
       storage: config.runHistoryStorage,
       file: config.runHistoryStorage === 'file' ? config.runHistoryFile : null,
@@ -548,9 +556,13 @@ app.get('/', (req, res) => {
 app.use(errorHandler)
 
 // ─── Start Server ────────────────────────────────────────────
-const PORT = config.port
-app.listen(PORT, () => {
-  console.log(`
+const isMainModule =
+  process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+
+if (isMainModule) {
+  const PORT = config.port
+  app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════════════╗
 ║         🧠 StellarMind — AI Agent Marketplace     ║
 ║         x402 Micropayments on Stellar Testnet     ║
@@ -565,4 +577,7 @@ app.listen(PORT, () => {
 ║  x402:       ${(config.serverAddress ? '✅ Active' : '⚠️  No wallet').padEnd(34)}║
 ╚══════════════════════════════════════════════════╝
   `)
-})
+  })
+}
+
+export { app, admissionQueue }
