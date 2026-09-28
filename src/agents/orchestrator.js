@@ -1,5 +1,6 @@
 import { config } from '../config.js'
 import { AGENTS, getAgentById } from './registry.js'
+import { validatePlan } from './plan-validator.js'
 import {
   runResearch,
   runSummary,
@@ -371,6 +372,11 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       .replace(/```\n?/g, '')
       .trim()
     plan = JSON.parse(cleanJson)
+    const validated = validatePlan(plan)
+    if (!validated.valid) {
+      throw new Error(`plan_validation_failed:${validated.reason}`)
+    }
+    plan = validated.plan
   } catch (err) {
     logger.warn('orchestrator_planning_fallback', {
       correlationId: context.correlationId,
@@ -404,6 +410,10 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       remaining -= 0.03
     }
 
+    subtasks.forEach((s, i) => {
+      s.stepId = `step-${i}`
+    })
+
     plan = {
       plan: `Multi-agent workflow: ${subtasks.map((s) => s.agentId).join(' → ')} (${subtasks.length} agents, ${budget} USDC budget)`,
       subtasks,
@@ -420,7 +430,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   for (const subtask of plan.subtasks || []) {
     const agent = getAgentById(subtask.agentId)
     if (!agent) {
-      results.push({ agentId: subtask.agentId, error: 'Agent not found' })
+      results.push({ agentId: subtask.agentId, stepId: subtask.stepId, error: 'Agent not found' })
       continue
     }
 
@@ -472,6 +482,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
     const agentResult = {
       agentId: agent.id,
+      stepId: subtask.stepId,
       agentName: agent.name,
       model: agent.model,
       input: subtask.input,
