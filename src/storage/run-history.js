@@ -2,6 +2,12 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { summarizeUsageByPhase } from '../agents/usage.js'
+import {
+  reconcilePaymentAttempt,
+  selectPendingAttempts,
+  summarizePaymentAttempts,
+  upsertPaymentAttempt,
+} from '../agents/payment-attempts.js'
 
 // Schema versioning constants
 const CURRENT_SCHEMA_VERSION = 1
@@ -61,6 +67,10 @@ export class InMemoryRunHistoryStore {
       error: null,
       events: [],
       txProofs: [],
+      // Payment attempts for this run (#131). Each entry is one logical
+      // charge; an `unknown` attempt stays here until reconciliation
+      // resolves it, so it is never silently settled twice.
+      paymentAttempts: [],
       // Provider token usage — kept separate from `summary` (settled
       // marketplace charges) so it never alters or masquerades as those
       // totals. Absent/unknown usage is represented explicitly, not as 0.
@@ -87,6 +97,10 @@ export class InMemoryRunHistoryStore {
       ...run,
       runId: run.id,
       outputAvailable: Boolean(run.outputAvailable ?? (run.results && run.results.length > 0)),
+      // Attempts that are still not settled — surfaced so a client can show
+      // "payment pending reconciliation" rather than a settled charge.
+      pendingPaymentAttempts: selectPendingAttempts(run.paymentAttempts),
+      paymentAttemptSummary: summarizePaymentAttempts(run.paymentAttempts),
     }
   }
 
@@ -100,6 +114,61 @@ export class InMemoryRunHistoryStore {
     if (!run) return
     run.events.push(toAuditEvent(event))
     run.updatedAt = new Date().toISOString()
+  }
+
+  /**
+   * Persists one payment attempt, upserted by its id.
+   *
+   * Upsert-by-id is what keeps "one logical charge, one record" true across
+   * retries, recovery, and restarts: a recovered settlement replaces the
+   * original attempt instead of appending a second one.
+   */
+  async recordPaymentAttempt(runId, attempt) {
+    const run = this.runs.find((entry) => entry.id === runId)
+    if (!run || !attempt) return null
+    run.paymentAttempts = upsertPaymentAttempt(run.paymentAttempts, attempt)
+    run.pendingPaymentAttempts = selectPendingAttempts(run.paymentAttempts)
+    run.updatedAt = new Date().toISOString()
+    return attempt
+  }
+
+  /** Every attempt still awaiting reconciliation, newest run first. */
+  async getPendingPayments() {
+    return this.runs.flatMap((run) =>
+      selectPendingAttempts(run.paymentAttempts).map((attempt) => ({
+        runId: run.id,
+        task: run.task,
+        attempt,
+      }))
+    )
+  }
+
+  /**
+   * Runs one reconciliation pass over attempts that are still pending.
+   *
+   * `probe(attempt)` is read-only by contract: it answers whether the earlier
+   * settlement completed and never starts a new one. Attempts it cannot
+   * resolve stay pending, which is what keeps a later fallback settlement
+   * from charging the same logical call twice.
+   */
+  async reconcilePendingPayments(probe, { runId } = {}) {
+    const runs = runId ? this.runs.filter((entry) => entry.id === runId) : this.runs
+    const reconciled = []
+    for (const run of runs) {
+      for (const attempt of selectPendingAttempts(run.paymentAttempts)) {
+        const resolved = await reconcilePaymentAttempt(attempt, { probe })
+        if (resolved && resolved !== attempt) {
+          run.paymentAttempts = upsertPaymentAttempt(run.paymentAttempts, resolved)
+          reconciled.push(resolved)
+        }
+      }
+      if (reconciled.length > 0) {
+        run.pendingPaymentAttempts = selectPendingAttempts(run.paymentAttempts)
+        run.paymentAttemptSummary = summarizePaymentAttempts(run.paymentAttempts)
+        run.updatedAt = new Date().toISOString()
+      }
+    }
+    return reconciled
   }
 
   async completeRun(runId, result) {
@@ -134,6 +203,15 @@ export class InMemoryRunHistoryStore {
     run.result = result
     run.outputAvailable = true
     run.txProofs = txProofs
+    // Attempts produced by this run. `unknown` ones stay pending so a later
+    // reconciliation pass can resolve them without a second settlement
+    // (#131) — they are never reported as settled charges.
+    run.paymentAttempts = (result.paymentAttempts || []).reduce(
+      (list, attempt) => upsertPaymentAttempt(list, attempt),
+      run.paymentAttempts || []
+    )
+    run.pendingPaymentAttempts = selectPendingAttempts(run.paymentAttempts)
+    run.paymentAttemptSummary = summarizePaymentAttempts(run.paymentAttempts)
     // Persist provider usage as its own field — never folded into
     // `run.summary`'s settled marketplace totals above. If the orchestrator
     // result carries no usage (defensive default), fall back to an
@@ -166,6 +244,8 @@ export class InMemoryRunHistoryStore {
       ...run,
       runId: run.id,
       outputAvailable: Boolean(run.outputAvailable ?? (run.results && run.results.length > 0)),
+      pendingPaymentAttempts: selectPendingAttempts(run.paymentAttempts),
+      paymentAttemptSummary: summarizePaymentAttempts(run.paymentAttempts),
     }))
   }
 
@@ -310,6 +390,18 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
   async appendEvent(runId, event) {
     await super.appendEvent(runId, event)
     await this.persist()
+  }
+
+  async recordPaymentAttempt(runId, attempt) {
+    const result = await super.recordPaymentAttempt(runId, attempt)
+    await this.persist()
+    return result
+  }
+
+  async reconcilePendingPayments(probe, options) {
+    const reconciled = await super.reconcilePendingPayments(probe, options)
+    if (reconciled.length > 0) await this.persist()
+    return reconciled
   }
 
   async completeRun(runId, result) {
