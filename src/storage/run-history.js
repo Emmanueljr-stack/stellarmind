@@ -263,44 +263,95 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
 
   async init() {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true })
+
+    // Step 1: read the file. Distinguish "doesn't exist yet" (first startup)
+    // from permission/I-O failures (fail-start, never overwrite) from a
+    // readable-but-corrupt file (recovery mode, see below).
+    let raw
     try {
-      const raw = await fs.readFile(this.filePath, 'utf8')
-      const parsed = JSON.parse(raw)
-      const { version, runs, idempotency } = this.validateAndMigrate(parsed)
-      if (Array.isArray(runs)) {
-        this.runs = runs.slice(0, this.maxRuns)
-      }
-      if (Array.isArray(idempotency)) {
-        for (const [key, record] of idempotency) {
-          this.idempotencyMap.set(key, record)
-        }
-      }
-      for (const run of this.runs) {
-        if (run.idempotencyKey && !this.idempotencyMap.has(run.idempotencyKey)) {
-          this.idempotencyMap.set(run.idempotencyKey, {
-            runId: run.id,
-            fingerprint: run.idempotencyFingerprint,
-            createdAt: run.createdAt,
-          })
-        }
-      }
-      // If migration occurred, persist the new format
-      if (version === LEGACY_VERSION) {
-        await this.persist()
-      }
+      raw = await fs.readFile(this.filePath, 'utf8')
     } catch (err) {
       if (err.code === 'ENOENT') {
-        // File doesn't exist yet, create it
+        // First startup: nothing to preserve, safe to create a fresh store.
         await this.persist()
-      } else if (err.message?.includes('Unsupported schema version')) {
-        // Future version - fail without rewriting
+        return
+      }
+      // Inaccessible file (permissions, I/O error, etc). This is NOT a
+      // first startup and NOT corruption we can safely recover from — the
+      // file may be perfectly readable once the underlying problem is
+      // fixed. Fail loudly, leave the file untouched, and let the operator
+      // decide instead of silently replacing it with an empty history.
+      this.failStart(
+        `unable to read history file at ${this.filePath} (${err.code || err.name || 'read error'}). ` +
+          'Check file permissions/disk health and restart; the file was left untouched.',
+        err
+      )
+    }
+
+    // Step 2: parse. A read that succeeds but doesn't parse is malformed
+    // JSON — preserve the original bytes before attempting recovery.
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (err) {
+      await this.handleCorruptedFile('malformed JSON', err)
+      await this.persist()
+      return
+    }
+
+    // Step 3: validate/migrate. An incompatible-but-newer schema fails
+    // without touching the file; anything else that fails validation is
+    // treated like corruption — preserved, then recovered.
+    let version, runs, idempotency
+    try {
+      ;({ version, runs, idempotency } = this.validateAndMigrate(parsed))
+    } catch (err) {
+      if (err.message?.includes('Unsupported schema version')) {
+        // Newer format than we understand - fail without rewriting.
+        console.error(`  run history: ${err.message}`)
         throw err
-      } else {
-        // File is corrupted or unreadable - preserve it and start fresh
-        await this.handleCorruptedFile(err)
-        await this.persist()
+      }
+      await this.handleCorruptedFile('invalid schema', err)
+      await this.persist()
+      return
+    }
+
+    if (Array.isArray(runs)) {
+      this.runs = runs.slice(0, this.maxRuns)
+    }
+    if (Array.isArray(idempotency)) {
+      for (const [key, record] of idempotency) {
+        this.idempotencyMap.set(key, record)
       }
     }
+    for (const run of this.runs) {
+      if (run.idempotencyKey && !this.idempotencyMap.has(run.idempotencyKey)) {
+        this.idempotencyMap.set(run.idempotencyKey, {
+          runId: run.id,
+          fingerprint: run.idempotencyFingerprint,
+          createdAt: run.createdAt,
+        })
+      }
+    }
+    // If migration occurred, persist the new format
+    if (version === LEGACY_VERSION) {
+      await this.persist()
+    }
+  }
+
+  /**
+   * Raises an actionable, task-content-free error for conditions the
+   * operator must resolve manually (permissions, I/O failures). Never
+   * includes file contents — only path and error code/name.
+   * @param {string} message
+   * @param {Error} [cause]
+   */
+  failStart(message, cause) {
+    const actionable = new Error(`run history: ${message}`)
+    if (cause) actionable.cause = cause
+    if (cause?.code) actionable.code = cause.code
+    console.error(actionable.message)
+    throw actionable
   }
 
   /**
@@ -335,18 +386,30 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
   }
 
   /**
-   * Handles corrupted or unreadable files by preserving them
-   * @param {Error} err - The error that occurred
+   * Preserves a readable-but-unusable file (malformed JSON or an
+   * incompatible/invalid schema) before recovery starts a fresh store.
+   * The original bytes are moved aside, never discarded, so an operator
+   * can inspect or repair them later. Only the error's category/code is
+   * logged — never file contents — since a run's `task` field may hold
+   * arbitrary operator-supplied text.
+   * @param {string} reason - short category, e.g. "malformed JSON"
+   * @param {Error} err - the error that occurred
    */
-  async handleCorruptedFile(err) {
+  async handleCorruptedFile(reason, err) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
     const backupPath = `${this.filePath}.corrupted.${timestamp}`
-    console.error(`  run history: file is corrupted, preserving at ${backupPath}`)
-    console.error(`  run history: error was: ${err.message}`)
+    console.error(`  run history: ${reason} detected, preserving original at ${backupPath}`)
+    console.error(`  run history: reason: ${err.code || err.name || err.message}`)
     try {
       await fs.rename(this.filePath, backupPath)
     } catch (renameErr) {
-      console.warn(`  run history: failed to preserve corrupted file: ${renameErr.message}`)
+      // Could not move the original aside — refuse to overwrite it with a
+      // fresh empty store, since that would destroy the only copy.
+      this.failStart(
+        `failed to preserve unreadable file before recovery (${renameErr.code || renameErr.message}). ` +
+          `Refusing to overwrite ${this.filePath}; move or fix it manually and restart.`,
+        renameErr
+      )
     }
   }
 
