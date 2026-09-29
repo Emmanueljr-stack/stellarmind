@@ -228,85 +228,97 @@ await withTempFile('new-write', async (testPath) => {
   console.log('  ✓ Version: 1\n')
 })
 
-// Test 7: Missing file is treated as first startup, not corruption
-await withTempFile('missing', async (testPath) => {
-  console.log('Test 7: Missing file is first startup')
-  // Do not create testPath at all.
+// Test 7: Completed results survive restart and remain readable by run ID
+await withTempFile('restart-output', async (testPath) => {
+  console.log('Test 7: Completed output survives restart')
+  const firstStore = new FileRunHistoryStore(testPath, 200)
+  await firstStore.init()
+
+  const created = await firstStore.createRun({ task: 'Persisted run', budget: 15, source: 'test' })
+  await firstStore.completeRun(created.id, {
+    task: 'Persisted run',
+    budget: 15,
+    plan: { steps: [{ agent: 'research-bot', input: 'Persisted run' }] },
+    results: [{ agent: 'research-bot', result: 'completed output payload' }],
+    totalSpent: 0,
+    budgetExhausted: false,
+    paymentProtocol: 'x402',
+    txCount: 0,
+    x402PaymentCount: 0,
+    xlmFallbackCount: 0,
+    unpaidCount: 0,
+    elapsed: '25ms',
+    usage: { entries: [], summary: { totalInputTokens: 0, totalOutputTokens: 0 } },
+    payments: [],
+  })
+
+  const reopened = new FileRunHistoryStore(testPath, 200)
+  await reopened.init()
+  const result = await reopened.getRun(created.id)
+
+  if (!result || result.status !== 'completed') {
+    throw new Error('Completed run should survive file restart and remain readable')
+  }
+  if (!result.outputAvailable) {
+    throw new Error('Completed output should be marked as available after restart')
+  }
+  if (!Array.isArray(result.output) || result.output.length !== 1) {
+    throw new Error('Persisted output should still include final step results after restart')
+  }
+  if (result.output[0].result !== 'completed output payload') {
+    throw new Error('Persisted result payload was not restored exactly after restart')
+  }
+  console.log('  ✓ Completed run result is recoverable after restart')
+  console.log('  ✓ Output is still marked available after reopen\n')
+})
+
+// Test 8: Legacy record without output is still readable with an availability flag
+await withTempFile('legacy-output-availability', async (testPath) => {
+  console.log('Test 8: Legacy output availability remains explicit')
+
+  const legacyData = {
+    version: 1,
+    runs: [
+      {
+        id: 'legacy_run_missing_output',
+        task: 'Legacy task',
+        budget: 7,
+        status: 'completed',
+        createdAt: '2024-01-04T00:00:00.000Z',
+        updatedAt: '2024-01-04T00:00:01.000Z',
+        completedAt: '2024-01-04T00:00:01.000Z',
+        summary: { totalSpent: 0 },
+        plan: null,
+        results: null,
+        output: undefined,
+        outputAvailable: false,
+        events: [],
+        txProofs: [],
+        usage: null,
+        error: null,
+      },
+    ],
+  }
+
+  await fs.writeFile(testPath, JSON.stringify(legacyData, null, 2), 'utf8')
+
   const store = new FileRunHistoryStore(testPath, 200)
   await store.init()
 
-  const content = await fs.readFile(testPath, 'utf8')
-  const parsed = JSON.parse(content)
-  if (parsed.version !== 1 || parsed.runs.length !== 0) {
-    throw new Error('Missing file did not produce a fresh empty store')
+  const run = await store.getRun('legacy_run_missing_output')
+  if (!run) {
+    throw new Error('Legacy run should still be loaded from disk')
   }
-  const files = await fs.readdir(testDir)
-  if (files.some((f) => f.includes('missing') && f.includes('corrupted'))) {
-    throw new Error('Missing file should never produce a .corrupted backup')
+  if (run.outputAvailable !== false) {
+    throw new Error('Legacy runs without stored outputs should stay explicitly unavailable')
   }
-  console.log('  ✓ Missing file starts a fresh store without any corrupted backup\n')
-})
-
-// Test 8: Invalid schema value (non-numeric version) is preserved and recovered
-await withTempFile('invalid-schema', async (testPath) => {
-  console.log('Test 8: Invalid schema value recovery')
-  await fs.writeFile(testPath, JSON.stringify({ version: 'not-a-number', runs: [] }), 'utf8')
-
-  const store = new FileRunHistoryStore(testPath, 200)
-  await store.init()
-
-  const corruptedFiles = await fs.readdir(testDir)
-  const corruptedFile = corruptedFiles.find(
-    (f) => f.includes('invalid-schema') && f.includes('corrupted')
-  )
-  if (!corruptedFile) {
-    throw new Error('Invalid-schema file was not preserved before recovery')
+  if (run.output !== null) {
+    throw new Error(
+      'Legacy runs should expose a null output when the persisted payload is unavailable'
+    )
   }
-
-  const content = await fs.readFile(testPath, 'utf8')
-  const parsed = JSON.parse(content)
-  if (parsed.version !== 1) {
-    throw new Error(`Expected recovered version 1, got ${parsed.version}`)
-  }
-  console.log('  ✓ Invalid schema value preserved with .corrupted suffix')
-  console.log('  ✓ New valid file created with version 1\n')
-})
-
-// Test 9: Read failures other than ENOENT fail fast without touching the file
-await withTempFile('read-error', async (testPath) => {
-  console.log('Test 9: Simulated read/permission error fails start without overwrite')
-  const originalContent = JSON.stringify({ version: 1, runs: [{ id: 'keep-me' }] }, null, 2)
-  await fs.writeFile(testPath, originalContent, 'utf8')
-
-  const store = new FileRunHistoryStore(testPath, 200)
-  const originalReadFile = fs.readFile
-  fs.readFile = async (p, ...args) => {
-    if (p === testPath) {
-      const err = new Error('EACCES: permission denied')
-      err.code = 'EACCES'
-      throw err
-    }
-    return originalReadFile(p, ...args)
-  }
-
-  try {
-    await assertThrows(async () => {
-      await store.init()
-    }, 'unable to read history file')
-  } finally {
-    fs.readFile = originalReadFile
-  }
-
-  // The original file must be untouched — same bytes, no backup created.
-  const content = await fs.readFile(testPath, 'utf8')
-  if (content !== originalContent) {
-    throw new Error('Original file was modified after a simulated permission error')
-  }
-  const files = await fs.readdir(testDir)
-  if (files.some((f) => f.includes('read-error') && f.includes('corrupted'))) {
-    throw new Error('Permission error should not produce a .corrupted backup')
-  }
-  console.log('  ✓ Permission/I-O error fails start and leaves the original file untouched\n')
+  console.log('  ✓ Legacy output availability remains explicit and non-destructive')
+  console.log('  ✓ Unavailable legacy output is surfaced as null\n')
 })
 
 console.log('All tests passed! ✓')

@@ -39,6 +39,66 @@ function toAuditEvent(event) {
   }
 }
 
+function hasPersistedRunOutput(run) {
+  if (!run || typeof run !== 'object') return false
+
+  const outputCandidates = [run.output, run.result?.output, run.result?.results, run.plan]
+
+  return outputCandidates.some((value) => {
+    if (Array.isArray(value)) return value.length > 0
+    if (value && typeof value === 'object') return true
+    return Boolean(value)
+  })
+}
+
+function normalizeRunRecord(run) {
+  if (!run || typeof run !== 'object') return run
+
+  const hasExplicitOutput = Object.prototype.hasOwnProperty.call(run, 'output')
+  const explicitOutput = hasExplicitOutput ? run.output : undefined
+  const outputFromRun = hasExplicitOutput
+    ? Array.isArray(explicitOutput)
+      ? explicitOutput
+      : (explicitOutput ?? null)
+    : Array.isArray(run.result?.output)
+      ? run.result.output
+      : Array.isArray(run.result?.results)
+        ? run.result.results
+        : Array.isArray(run.results) && run.results.length > 0
+          ? run.results
+          : null
+
+  const normalized = {
+    ...run,
+    plan: run.plan ?? run.result?.plan ?? null,
+    results: Array.isArray(run.results) ? run.results : (outputFromRun ?? []),
+    output: outputFromRun ?? null,
+    error: run.error ?? null,
+    summary: run.summary ?? null,
+    usage: run.usage ?? null,
+    txProofs: Array.isArray(run.txProofs) ? run.txProofs : [],
+    events: Array.isArray(run.events) ? run.events : [],
+  }
+
+  normalized.outputAvailable = Boolean(
+    run.outputAvailable ?? (run.status === 'completed' && hasPersistedRunOutput(normalized))
+  )
+
+  if (normalized.status === 'failed') {
+    normalized.outputAvailable = false
+  }
+
+  if (!normalized.output && normalized.status !== 'completed') {
+    normalized.output = null
+  }
+
+  if (!normalized.results && normalized.status === 'completed' && !normalized.output) {
+    normalized.results = []
+  }
+
+  return normalized
+}
+
 export class InMemoryRunHistoryStore {
   constructor(maxRuns = 200) {
     this.maxRuns = maxRuns
@@ -93,15 +153,10 @@ export class InMemoryRunHistoryStore {
   async getRun(runId) {
     const run = this.runs.find((entry) => entry.id === runId)
     if (!run) return null
-    return {
+    return normalizeRunRecord({
       ...run,
       runId: run.id,
-      outputAvailable: Boolean(run.outputAvailable ?? (run.results && run.results.length > 0)),
-      // Attempts that are still not settled — surfaced so a client can show
-      // "payment pending reconciliation" rather than a settled charge.
-      pendingPaymentAttempts: selectPendingAttempts(run.paymentAttempts),
-      paymentAttemptSummary: summarizePaymentAttempts(run.paymentAttempts),
-    }
+    })
   }
 
   async getIdempotencyRecord(key) {
@@ -183,6 +238,12 @@ export class InMemoryRunHistoryStore {
         explorerUrl: payment.explorerUrl || null,
       }))
 
+    const completedOutput = Array.isArray(result.output)
+      ? result.output
+      : Array.isArray(result.results)
+        ? result.results
+        : null
+
     run.status = 'completed'
     run.completedAt = new Date().toISOString()
     run.updatedAt = run.completedAt
@@ -198,8 +259,8 @@ export class InMemoryRunHistoryStore {
       elapsed: result.elapsed,
     }
     run.plan = result.plan || null
-    run.results = result.results || []
-    run.output = result.results || []
+    run.results = Array.isArray(result.results) ? result.results : completedOutput || []
+    run.output = completedOutput || run.results || null
     run.result = result
     run.outputAvailable = true
     run.txProofs = txProofs
@@ -236,17 +297,15 @@ export class InMemoryRunHistoryStore {
       message: err?.message || 'unknown error',
       code: err?.code || 'EXECUTION_FAILED',
     }
+    run.output = null
+    run.results = Array.isArray(run.results) ? run.results : []
     run.outputAvailable = false
   }
 
   async listRecent(limit = 20) {
-    return this.runs.slice(0, normalizeLimit(limit, 20, this.maxRuns)).map((run) => ({
-      ...run,
-      runId: run.id,
-      outputAvailable: Boolean(run.outputAvailable ?? (run.results && run.results.length > 0)),
-      pendingPaymentAttempts: selectPendingAttempts(run.paymentAttempts),
-      paymentAttemptSummary: summarizePaymentAttempts(run.paymentAttempts),
-    }))
+    return this.runs
+      .slice(0, normalizeLimit(limit, 20, this.maxRuns))
+      .map((run) => normalizeRunRecord({ ...run, runId: run.id }))
   }
 
   async flush() {
@@ -364,7 +423,11 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
     if (data.version === undefined) {
       // Legacy unversioned format (version 0)
       console.warn('  run history: migrating legacy unversioned format to version 1')
-      return { version: LEGACY_VERSION, runs: data.runs || [], idempotency: data.idempotency || [] }
+      return {
+        version: LEGACY_VERSION,
+        runs: (data.runs || []).map((run) => normalizeRunRecord(run)),
+        idempotency: data.idempotency || [],
+      }
     }
 
     // Validate version is a number
@@ -382,7 +445,11 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
     }
 
     // Version is within supported range
-    return { version, runs: data.runs || [], idempotency: data.idempotency || [] }
+    return {
+      version,
+      runs: (data.runs || []).map((run) => normalizeRunRecord(run)),
+      idempotency: data.idempotency || [],
+    }
   }
 
   /**
