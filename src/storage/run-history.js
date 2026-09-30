@@ -78,7 +78,7 @@ function normalizeRunRecord(run) {
   const normalized = {
     ...run,
     plan: run.plan ?? run.result?.plan ?? null,
-    results: Array.isArray(run.results) ? run.results : (outputFromRun ?? []),
+    results: Array.isArray(run.results) ? run.results : (outputFromRun ?? null),
     output: outputFromRun ?? null,
     error: run.error ?? null,
     summary: run.summary ?? null,
