@@ -349,7 +349,12 @@ components:
 
     RunDetail:
       type: object
-      description: Full run record including status, output, and error information
+      description: |
+        Full run record including status, output, and error information.
+        - running: `output` is `null` and `outputAvailable` is `false`
+        - failed: `output` is `null`, `outputAvailable` is `false`, and `error` holds the failure data
+        - completed: `output` contains the persisted orchestration results and `outputAvailable` is `true`
+        - legacy records without persisted output: `output` remains `null` and `outputAvailable` is `false`
       properties:
         runId:
           type: string
@@ -372,13 +377,13 @@ components:
           nullable: true
         outputAvailable:
           type: boolean
-          description: True when the run has completed and output is available
+          description: true only when the final output has been persisted and is safe to read
         output:
           type: array
           items:
             type: object
           nullable: true
-          description: The orchestration results (null until completed)
+          description: Persisted orchestration results. Null while running, after failures, or for legacy records without stored output.
         error:
           type: object
           nullable: true
