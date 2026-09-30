@@ -383,7 +383,9 @@ components:
           items:
             type: object
           nullable: true
-          description: Persisted orchestration results. Null while running, after failures, or for legacy records without stored output.
+          description:
+            Persisted orchestration results. Null while running, after failures, or for legacy
+            records without stored output.
         error:
           type: object
           nullable: true
